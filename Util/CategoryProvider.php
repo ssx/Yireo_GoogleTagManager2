@@ -3,14 +3,11 @@ declare(strict_types=1);
 
 namespace Yireo\GoogleTagManager2\Util;
 
-use Magento\Catalog\Api\CategoryListInterface;
 use Magento\Catalog\Api\Data\CategoryInterface;
 use Magento\Catalog\Api\Data\ProductInterface;
 use Magento\Catalog\Model\Product;
-use Magento\Framework\Api\FilterBuilder;
-use Magento\Framework\Api\Search\FilterGroup;
-use Magento\Framework\Api\Search\FilterGroupBuilder;
-use Magento\Framework\Api\SearchCriteriaBuilder;
+use Magento\Catalog\Model\ResourceModel\Category\Collection;
+use Magento\Catalog\Model\ResourceModel\Category\CollectionFactory;
 use Magento\Framework\Exception\NoSuchEntityException;
 use Magento\Store\Model\Store;
 use Magento\Store\Model\StoreManagerInterface;
@@ -19,32 +16,32 @@ use Yireo\GoogleTagManager2\Exception\NotUsingSetProductSkusException;
 class CategoryProvider
 {
     /**
-     * @var int[]
+     * @var array<int, int[]> Requested category ids, keyed by store id
      */
     private array $categoryIds = [];
 
     /**
-     * @var CategoryInterface[]
+     * @var array<int, CategoryInterface[]> Resolved categories, keyed by store id then category id
      */
     private array $loadedCategories = [];
 
-    private CategoryListInterface $categoryListRepository;
-    private FilterBuilder $filterBuilder;
-    private SearchCriteriaBuilder $searchCriteriaBuilder;
-    private FilterGroupBuilder $filterGroupBuilder;
+    /**
+     * @var array<int, array<int, bool>> Ids already looked up, resolved or not, keyed by store id
+     */
+    private array $attemptedCategoryIds = [];
+
+    private CollectionFactory $categoryCollectionFactory;
     private StoreManagerInterface $storeManager;
 
+    /**
+     * @param CollectionFactory $categoryCollectionFactory
+     * @param StoreManagerInterface $storeManager
+     */
     public function __construct(
-        CategoryListInterface $categoryListRepository,
-        FilterBuilder $filterBuilder,
-        SearchCriteriaBuilder $searchCriteriaBuilder,
-        FilterGroupBuilder $filterGroupBuilder,
+        CollectionFactory $categoryCollectionFactory,
         StoreManagerInterface $storeManager
     ) {
-        $this->categoryListRepository = $categoryListRepository;
-        $this->filterBuilder = $filterBuilder;
-        $this->searchCriteriaBuilder = $searchCriteriaBuilder;
-        $this->filterGroupBuilder = $filterGroupBuilder;
+        $this->categoryCollectionFactory = $categoryCollectionFactory;
         $this->storeManager = $storeManager;
     }
 
@@ -55,12 +52,15 @@ class CategoryProvider
      */
     public function addCategoryIds(array $categoryIds)
     {
-        $categoryIds = $this->filterRootCategoryIdFromCategoryIds($categoryIds);
+        $categoryIds = $this->filterCategoryIds($categoryIds);
         if (empty($categoryIds)) {
             return;
         }
 
-        $this->categoryIds = array_unique(array_merge($this->categoryIds, $categoryIds));
+        $storeId = $this->getStoreId();
+        $this->categoryIds[$storeId] = array_values(
+            array_unique(array_merge($this->categoryIds[$storeId] ?? [], $categoryIds))
+        );
     }
 
     /**
@@ -70,10 +70,9 @@ class CategoryProvider
      */
     public function getById(int $categoryId): CategoryInterface
     {
-        foreach ($this->getLoadedCategories() as $category) {
-            if ((int)$category->getId() === $categoryId) {
-                return $category;
-            }
+        $categories = $this->getLoadedCategories();
+        if (isset($categories[$categoryId])) {
+            return $categories[$categoryId];
         }
 
         throw new NotUsingSetProductSkusException('Using getCategoryById() delivers no result');
@@ -85,20 +84,35 @@ class CategoryProvider
      */
     public function getLoadedCategories(): array
     {
-        if (empty($this->categoryIds)) {
+        $storeId = $this->getStoreId();
+        if (empty($this->categoryIds[$storeId])) {
             throw new NotUsingSetProductSkusException('Using getCategories() before setCategoryIds()');
         }
 
-        $loadCategoryIds = array_diff($this->categoryIds, array_keys($this->loadedCategories));
+        $loadCategoryIds = array_diff(
+            $this->categoryIds[$storeId],
+            array_keys($this->attemptedCategoryIds[$storeId] ?? [])
+        );
+
         if (count($loadCategoryIds) > 0) {
+            // Remember every id that was asked for, not only the ones that came back. An id that
+            // resolves to nothing - a category outside this store's root, for instance - would
+            // otherwise be looked up again for every following product.
+            foreach ($loadCategoryIds as $categoryId) {
+                $this->attemptedCategoryIds[$storeId][$categoryId] = true;
+            }
+
             foreach ($this->loadCategoriesByIds($loadCategoryIds) as $category) {
-                $this->loadedCategories[(int)$category->getId()] = $category;
+                $this->loadedCategories[$storeId][(int)$category->getId()] = $category;
             }
         }
 
-        return array_filter($this->loadedCategories, static function (CategoryInterface $category) {
-            return $category->getIsActive();
-        });
+        return array_filter(
+            $this->loadedCategories[$storeId] ?? [],
+            static function (CategoryInterface $category) {
+                return $category->getIsActive();
+            }
+        );
     }
 
     /**
@@ -109,22 +123,18 @@ class CategoryProvider
     public function getFirstByProduct(ProductInterface $product): CategoryInterface
     {
         /** @var Product $product */
-        $productCategoryIds = $product->getCategoryIds();
-        $productCategoryIds = $this->filterRootCategoryIdFromCategoryIds($productCategoryIds);
+        $productCategoryIds = $this->filterCategoryIds($product->getCategoryIds());
         if (empty($productCategoryIds)) {
             throw new NoSuchEntityException(__('Product "%1" has no categories', $product->getSku()));
         }
 
-        $category = null;
-        while ($category === null && $productCategoryId = array_shift($productCategoryIds)) {
-            $this->addCategoryIds([$productCategoryId]);
-            if ($this->categoryIds) {
-                $category = $this->getLoadedCategories()[$productCategoryId] ?? null;
-            }
-        }
+        $this->addCategoryIds($productCategoryIds);
+        $categories = $this->getLoadedCategories();
 
-        if ($category instanceof CategoryInterface) {
-            return $category;
+        foreach ($productCategoryIds as $productCategoryId) {
+            if (isset($categories[$productCategoryId])) {
+                return $categories[$productCategoryId];
+            }
         }
 
         throw new NoSuchEntityException(__('Product "%1" has no categories', $product->getSku()));
@@ -138,65 +148,67 @@ class CategoryProvider
     public function getAllByProduct(ProductInterface $product): array
     {
         /** @var Product $product */
-        $productCategoryIds = $product->getCategoryIds();
-        $productCategoryIds = $this->filterRootCategoryIdFromCategoryIds($productCategoryIds);
+        $productCategoryIds = $this->filterCategoryIds($product->getCategoryIds());
         if (empty($productCategoryIds)) {
             throw new NoSuchEntityException(__('Product "%1" has no categories', $product->getSku()));
         }
 
         $this->addCategoryIds($productCategoryIds);
+        $categories = $this->getLoadedCategories();
 
-        return array_intersect_key($this->getLoadedCategories(), array_flip($productCategoryIds));
+        // Ordered by the product's own category ids, so a product reports the same categories
+        // wherever it is rendered. Ordering by the order the categories happened to be loaded in
+        // makes the result depend on which other products were mapped earlier in the same request.
+        $productCategories = [];
+        foreach ($productCategoryIds as $productCategoryId) {
+            if (isset($categories[$productCategoryId])) {
+                $productCategories[$productCategoryId] = $categories[$productCategoryId];
+            }
+        }
+
+        return $productCategories;
     }
 
     /**
-     * @param array $categoryIds
+     * Load every requested category in a single query, selecting only the attributes that the data
+     * layer reads.
+     *
+     * @param int[] $categoryIds
      * @return CategoryInterface[]
      * @throws NoSuchEntityException
      */
     private function loadCategoriesByIds(array $categoryIds): array
     {
-        /** @var FilterGroup $entityIdFilterGroup */
-        $entityIdFilterGroup = $this->filterGroupBuilder->create();
-        $entityIdFilterGroup->setFilters([
-            $this->filterBuilder
-                ->setField('entity_id')
-                ->setConditionType('in')
-                ->setValue($categoryIds)
-                ->create(),
-        ]);
+        /** @var Collection $collection */
+        $collection = $this->categoryCollectionFactory->create();
+        $collection->setStoreId($this->getStoreId());
+        $collection->addAttributeToSelect(['name', 'is_active']);
+        $collection->addIdFilter($categoryIds);
+        $collection->addFieldToFilter('path', ['like' => '1/' . $this->getRootCategoryId() . '/%']);
 
-        /** @var FilterGroup $rootCategoryFilterGroup */
-        $rootCategoryFilterGroup = $this->filterGroupBuilder->create();
-        $rootCategoryFilterGroup->setFilters([
-            $this->filterBuilder
-                ->setField('path')
-                ->setConditionType('like')
-                ->setValue('1/' . $this->getRootCategoryId() . '/%')
-                ->create(),
-        ]);
-
-        $this->searchCriteriaBuilder->setFilterGroups([
-            $entityIdFilterGroup,
-            $rootCategoryFilterGroup,
-        ]);
-
-        $searchCriteria = $this->searchCriteriaBuilder->create();
-
-        return $this->categoryListRepository->getList($searchCriteria)->getItems();
+        return $collection->getItems();
     }
 
     /**
+     * Drop the root category and anything that is not a usable id, and normalise to unique integers.
+     *
      * @param array $categoryIds
-     * @return array
+     * @return int[]
      * @throws NoSuchEntityException
      */
-    private function filterRootCategoryIdFromCategoryIds(array $categoryIds): array
+    private function filterCategoryIds(array $categoryIds): array
     {
         $rootCategoryId = $this->getRootCategoryId();
-        return array_filter($categoryIds, static function ($categoryId) use ($rootCategoryId) {
-            return (int)$categoryId !== $rootCategoryId;
-        });
+
+        $filteredCategoryIds = [];
+        foreach ($categoryIds as $categoryId) {
+            $categoryId = (int)$categoryId;
+            if ($categoryId > 0 && $categoryId !== $rootCategoryId) {
+                $filteredCategoryIds[] = $categoryId;
+            }
+        }
+
+        return array_values(array_unique($filteredCategoryIds));
     }
 
     /**
@@ -207,6 +219,16 @@ class CategoryProvider
     {
         /** @var Store $store */
         $store = $this->storeManager->getStore();
+
         return (int)$store->getRootCategoryId();
+    }
+
+    /**
+     * @return int
+     * @throws NoSuchEntityException
+     */
+    private function getStoreId(): int
+    {
+        return (int)$this->storeManager->getStore()->getId();
     }
 }

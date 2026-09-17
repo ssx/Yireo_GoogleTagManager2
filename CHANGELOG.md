@@ -5,6 +5,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- Resolve data layer categories with a single collection query instead of one entity load per category
+- Stop looking up the same unresolvable category id once per product
+- Return a product's categories in the order of its own category ids, so `item_category` no longer
+  depends on which other products were mapped earlier in the same request
+
 
 ## [3.10.7] - 24 February 2026
 ### Fixed
