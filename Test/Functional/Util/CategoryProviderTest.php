@@ -52,4 +52,34 @@ class CategoryProviderTest extends TestCase
         $categories = $categoryProvider->getAllByProduct($product);
         $this->assertEquals(2, count($categories));
     }
+
+    public function testGetAllByProductFollowsTheOrderOfTheProductCategoryIds()
+    {
+        $productRepository = ObjectManager::getInstance()->get(ProductRepositoryInterface::class);
+        $product = $productRepository->getById(1);
+
+        $categoryProvider = ObjectManager::getInstance()->create(CategoryProvider::class);
+        $categories = $categoryProvider->getAllByProduct($product);
+
+        $productCategoryIds = array_map('intval', $product->getCategoryIds());
+        $expectedOrder = array_values(array_intersect($productCategoryIds, array_keys($categories)));
+
+        $this->assertSame($expectedOrder, array_keys($categories));
+    }
+
+    public function testGetAllByProductIsNotAffectedByEarlierLookups()
+    {
+        $productRepository = ObjectManager::getInstance()->get(ProductRepositoryInterface::class);
+        $product = $productRepository->getById(1);
+
+        $freshProvider = ObjectManager::getInstance()->create(CategoryProvider::class);
+        $expected = $freshProvider->getAllByProduct($product);
+
+        $usedProvider = ObjectManager::getInstance()->create(CategoryProvider::class);
+        $usedProvider->addCategoryIds([11, 38, 12, 14]);
+        $usedProvider->getLoadedCategories();
+        $actual = $usedProvider->getAllByProduct($product);
+
+        $this->assertSame(array_keys($expected), array_keys($actual));
+    }
 }
